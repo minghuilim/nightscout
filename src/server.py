@@ -22,6 +22,8 @@ from src.nightscout_client import (
 )
 
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+EVENT_TIME_FUTURE_TOLERANCE = timedelta(minutes=5)
+SAME_TIME_LOOKUP_WINDOW = timedelta(seconds=1)
 
 mcp = FastMCP("nightscout")
 
@@ -296,6 +298,73 @@ def get_insulin_on_board() -> dict:
     return result
 
 
+class EventTimeError(ValueError):
+    """An event_time that cannot be used for a backdated treatment."""
+
+
+def _to_nightscout_utc(moment: datetime) -> str:
+    """Format a time the way Nightscout stores created_at."""
+    utc = moment.astimezone(timezone.utc)
+    millis = utc.microsecond // 1000
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{millis:03d}Z"
+
+
+def _parse_event_time(event_time: str) -> datetime:
+    """Parse an ISO 8601 time that states its timezone offset."""
+    try:
+        moment = datetime.fromisoformat(event_time)
+    except ValueError:
+        raise EventTimeError(
+            f"event_time '{event_time}' is not an ISO 8601 time, "
+            "e.g. '2026-11-04T08:10:00+08:00'"
+        )
+    if moment.tzinfo is None:
+        raise EventTimeError(
+            f"event_time '{event_time}' has no timezone offset; "
+            "add one, e.g. '+08:00' or 'Z'"
+        )
+    latest = datetime.now(timezone.utc) + EVENT_TIME_FUTURE_TOLERANCE
+    if moment > latest:
+        raise EventTimeError(
+            f"event_time '{event_time}' is in the future; "
+            "treatments can only be logged for now or the past"
+        )
+    return moment.replace(microsecond=0)
+
+
+def _same_time_treatment_exists(
+    event_type: str, moment: datetime
+) -> bool:
+    """True if a treatment of this type is already stored at this time.
+
+    Nightscout can merge a new treatment into one with the same
+    created_at and eventType, so a match must not be written over.
+    """
+    stored_at = _to_nightscout_utc(moment)
+    nearby = get_treatments_by_range(
+        _to_nightscout_utc(moment - SAME_TIME_LOOKUP_WINDOW),
+        _to_nightscout_utc(moment + SAME_TIME_LOOKUP_WINDOW),
+        count=50,
+    )
+    return any(
+        t.get("eventType") == event_type
+        and t.get("created_at") == stored_at
+        for t in nearby
+    )
+
+
+def _backdated_created_at(event_type: str, event_time: str) -> str:
+    """Validate event_time and return it as created_at for Nightscout."""
+    moment = _parse_event_time(event_time)
+    if _same_time_treatment_exists(event_type, moment):
+        raise EventTimeError(
+            f"A '{event_type}' treatment is already logged at "
+            f"{moment.isoformat()}. Nothing was saved. Use a time a "
+            "minute apart, or combine the two into one entry."
+        )
+    return moment.isoformat()
+
+
 @mcp.tool()
 def log_treatment(
     event_type: str,
@@ -305,6 +374,7 @@ def log_treatment(
     insulin: Optional[float] = None,
     duration: Optional[int] = None,
     notes: Optional[str] = None,
+    event_time: Optional[str] = None,
 ) -> any:
     """Log a new treatment entry to Nightscout.
 
@@ -320,10 +390,23 @@ def log_treatment(
         insulin: Optional insulin in units
         duration: Optional duration in minutes (for temp basals, exercise)
         notes: Optional text note
+        event_time: Optional time the treatment actually happened, for
+            backdating. ISO 8601 with a timezone offset, e.g.
+            '2026-11-04T08:10:00+08:00'. Must not be in the future.
+            Omit to use the current time. For a past glucose reading,
+            use event_type 'BG Check' with glucose and glucose_type.
     """
+    if event_time:
+        try:
+            created_at = _backdated_created_at(event_type, event_time)
+        except EventTimeError as error:
+            return {"error": str(error)}
+    else:
+        created_at = datetime.now(timezone.utc).isoformat()
+
     treatment: dict = {
         "eventType": event_type,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at,
     }
     if glucose is not None:
         treatment["glucose"] = glucose
