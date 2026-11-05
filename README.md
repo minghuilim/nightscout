@@ -22,7 +22,7 @@ Built with [FastMCP](https://github.com/jlowin/fastmcp), this server exposes Nig
 
 - **get_recent_treatments** — recent insulin boluses, carb entries, temp basals, notes
 - **get_treatments_by_date** — treatments for a specific date range
-- **log_treatment** — log a new treatment (bolus, carbs, exercise, note, etc.)
+- **log_treatment** — log a new treatment (bolus, carbs, exercise, note, etc.); optional `event_time` (ISO 8601 with offset) backdates it
 - **remove_treatment** — delete a treatment by ID
 
 ### Device & Profile
